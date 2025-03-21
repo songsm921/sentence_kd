@@ -4,7 +4,7 @@
 TEACHER_MODEL="/mnt/cephfs/sumin/model/Llama-3.2-3B-Instruct"
 STUDENT_MODEL="/mnt/cephfs/sumin/model/Llama-3.2-1B-Instruct"
 OUTPUT_DIR="./output"
-KD_MODE="hybrid"  # Options: token, sentence, hybrid
+KD_MODE="sentence"  # Options: token, sentence, hybrid
 PREFIX_LENGTH=10  # Number of prefix tokens to use for KD (0 = use all tokens)
 
 # Create output directory

@@ -35,7 +35,9 @@ import wandb
 # Import config and dataset utilities
 from config import parse_args
 from dataset import prepare_datasets, create_dataloaders
-
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+logging.getLogger("transformers").setLevel(logging.ERROR)
 # Configure logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -129,61 +131,81 @@ class SentenceLevelKD(nn.Module):
         self.teacher_model.eval()
     
     def forward(self, input_ids, attention_mask, labels=None):
+        # 기본적인 학생 모델 출력부터 얻기 (CE loss 계산용)
+        student_outputs = self.student_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            return_dict=True,
+        )
+        
+        ce_loss = student_outputs.loss
+        # pad_token_id = self.teacher_model.config.eos_token_id
         # Generate pseudo-targets from teacher
+        prev_level = logging.getLogger("transformers").level
+        logging.getLogger("transformers").setLevel(logging.ERROR)
         with torch.no_grad():
             # For sentence-level KD, we use the teacher model to generate outputs
-            # These outputs are then used as targets for the student model
-            teacher_outputs = self.teacher_model.generate(
+            teacher_generated = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=100,
                 do_sample=True,
                 num_beams=1,
+                # pad_token_id=pad_token_id 
             )
+            
+            # 학생 모델도 generate 하여 시퀀스 생성
+            student_generated = self.student_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=100,
+                do_sample=True,
+                num_beams=1,
+                # pad_token_id=pad_token_id 
+            )
+        logging.getLogger("transformers").setLevel(prev_level)
+        # 안전하게 sentence-level KD loss 계산
+        try:
+            # 입력 길이 확인
+            input_length = input_ids.size(1)
+            
+            # 두 모델의 출력 길이 맞추기
+            min_length = min(teacher_generated.size(1), student_generated.size(1))
+            
+            # If prefix_length is set, use only the prefix tokens for KD
+            if self.prefix_length > 0:
+                # 새로 생성된 토큰들의 prefix만 사용
+                max_length = min(input_length + self.prefix_length, min_length)
+            else:
+                # 전체 시퀀스 사용
+                max_length = min_length
+            
+            # 두 시퀀스를 동일한 길이로 자르기
+            teacher_slice = teacher_generated[:, :max_length].contiguous()
+            student_slice = student_generated[:, :max_length].contiguous()
+            
+            # simple token matching loss - 직접 비교
+            loss_mask = (teacher_slice != -100)  # -100은 무시
+            
+            # 단순화된 토큰 일치 손실 계산 방법
+            matching_loss = (teacher_slice != student_slice).float() * loss_mask.float()
+            sentence_loss = matching_loss.sum() / (loss_mask.sum() + 1e-8)
+            
+            logger.debug(f"Sentence-level KD using {'prefix of ' + str(self.prefix_length) if self.prefix_length > 0 else 'full sequence'}")
+            
+        except Exception as e:
+            # 안전을 위해 예외 발생시 손실을 0으로 설정
+            logger.warning(f"Error in sentence-level KD: {e}")
+            sentence_loss = torch.tensor(0.0, device=ce_loss.device)
         
-        # If prefix_length is set, use only the prefix tokens for KD
-        if self.prefix_length > 0:
-            # Create labels with only the first prefix_length tokens from teacher outputs
-            # Set the rest to -100 (ignored in loss calculation)
-            prefix_labels = teacher_outputs.clone()
-            
-            # Find actual sequence length for each example (excluding padding)
-            seq_lengths = torch.sum(teacher_outputs != self.teacher_model.config.pad_token_id, dim=1)
-            
-            # For each example, keep only the first prefix_length tokens, set rest to -100
-            for i in range(prefix_labels.size(0)):
-                # Determine the actual prefix length (min of sequence length and prefix_length)
-                actual_prefix_len = min(int(seq_lengths[i].item()), self.prefix_length)
-                
-                # Set all tokens after the prefix to -100
-                if actual_prefix_len < prefix_labels.size(1):
-                    prefix_labels[i, actual_prefix_len:] = -100
-            
-            # Use prefix labels for KD
-            teacher_targets = prefix_labels
-            
-            logger.debug(f"Using prefix of length {self.prefix_length} for sentence-level KD")
-        else:
-            # Use full teacher outputs as targets
-            teacher_targets = teacher_outputs
-            
-            logger.debug("Using full teacher outputs for sentence-level KD")
-        
-        # Get student outputs using teacher outputs as labels
-        # This implements the sentence-level distillation - the student is trained 
-        # with the teacher's output (or prefix thereof) as the target
-        student_outputs = self.student_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=teacher_targets,
-            return_dict=True,
-        )
-        
-        # Loss is already the cross-entropy between student predictions and teacher outputs
-        loss = student_outputs.loss
+        # 최종 손실: 기본 CE 손실 + 문장 수준 KD 손실
+        loss = ce_loss + sentence_loss
         
         return {
             "loss": loss,
+            "sentence_loss": sentence_loss,
+            "ce_loss": ce_loss,
             "logits": student_outputs.logits,
         }
 
@@ -205,7 +227,7 @@ class HybridKD(nn.Module):
         
         # Initialize the gate parameter as described in the paper
         # This will be learned during training to balance token-level and sentence-level KD
-        self.gate = nn.Parameter(torch.tensor(initial_gate_value).log())
+        self.gate = nn.Parameter(torch.tensor([initial_gate_value]).log())
         
         # Freeze teacher model
         for param in self.teacher_model.parameters():
@@ -215,10 +237,11 @@ class HybridKD(nn.Module):
     
     def get_gate_value(self):
         """Convert gate parameter to a value between 0 and 1 using sigmoid"""
-        return torch.sigmoid(self.gate)
+        # 명시적으로 스칼라 값을 반환하도록 수정
+        return torch.sigmoid(self.gate).item()
     
     def forward(self, input_ids, attention_mask, labels=None):
-        # Get student outputs
+        # Get student outputs for token-level KD
         student_outputs = self.student_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -241,7 +264,16 @@ class HybridKD(nn.Module):
             teacher_generated = self.teacher_model.generate(
                 input_ids=input_ids, 
                 attention_mask=attention_mask,
-                max_new_tokens = 100,
+                max_new_tokens=100,
+                do_sample=True,
+                num_beams=1,
+            )
+            
+            # 학생 모델도 generate 수행
+            student_generated = self.student_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=100,
                 do_sample=True,
                 num_beams=1,
             )
@@ -254,30 +286,35 @@ class HybridKD(nn.Module):
             log_target=False,
         ) * (self.temperature ** 2)
         
-        # Prepare teacher outputs for sentence-level KD
-        if self.prefix_length > 0:
-            # Create a copy for modification
-            prefix_generated = teacher_generated.clone()
-            
-            # Find actual sequence length for each example
-            seq_lengths = torch.sum(prefix_generated != self.teacher_model.config.pad_token_id, dim=1)
-            
-            # For each example, keep only the first prefix_length tokens for loss calculation
-            for i in range(prefix_generated.size(0)):
-                actual_prefix_len = min(int(seq_lengths[i].item()), self.prefix_length)
-                if actual_prefix_len < prefix_generated.size(1):
-                    prefix_generated[i, actual_prefix_len:] = -100  # Ignore these tokens in loss
-            
-            sentence_targets = prefix_generated
-        else:
-            sentence_targets = teacher_generated
+        # 두 모델의 출력 길이 맞추기 - 가장 간단한 해결책
+        min_length = min(teacher_generated.size(1), student_generated.size(1))
+        teacher_tokens = teacher_generated[:, :min_length].clone()
+        student_tokens = student_generated[:, :min_length].clone()
         
-        # Calculate sentence-level KD loss (matching teacher's generated outputs)
-        # Calculate cross-entropy loss between student predictions and teacher's generated tokens
+        # If prefix_length is set, use only the prefix tokens for KD
+        if self.prefix_length > 0:
+            # prefix_length를 넘어서는 토큰은 무시 (-100 마스킹)
+            prefix_length = min(self.prefix_length, min_length)
+            
+            # 입력 시퀀스 이후의 새로 생성된 토큰만 고려
+            # 이미 입력된 토큰들의 수를 계산 (input_ids의 길이)
+            input_length = input_ids.size(1)
+            
+            # prefix_length 만큼만 유지하고 나머지는 마스킹
+            if input_length + prefix_length < min_length:
+                teacher_tokens[:, input_length + prefix_length:] = -100
+                student_tokens[:, input_length + prefix_length:] = -100
+            
+            logger.debug(f"Using prefix of length {prefix_length} for sentence-level KD")
+        
+        # 각 토큰 위치별로 직접 비교 (cross entropy 사용)
         sentence_kd_loss = F.cross_entropy(
-            student_logits.view(-1, student_logits.size(-1)),
-            sentence_targets.view(-1),
-            ignore_index=-100,
+            # [batch_size*seq_len, vocab_size] 형태로 변환
+            F.one_hot(student_tokens.reshape(-1), num_classes=self.student_model.config.vocab_size).float(),
+            # [batch_size*seq_len] 형태로 변환
+            teacher_tokens.reshape(-1),
+            ignore_index=-100,  # -100인 위치는 손실 계산에서 제외
+            reduction='mean'
         )
         
         # Apply gating mechanism
@@ -347,26 +384,33 @@ def train(args):
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Load teacher model
+    # 로그 레벨 조정 - transformers 경고 감추기
+    transformers_logger = logging.getLogger("transformers")
+    transformers_logger.setLevel(logging.WARNING)  # INFO 대신 WARNING 레벨 사용
+    
+    # Load teacher model - pad_token_id 명시적 설정
     logger.info(f"Loading teacher model from {args.teacher_model_name_or_path}")
     teacher_model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model_name_or_path,
         torch_dtype=torch.bfloat16,
         device_map="auto" if args.local_rank == -1 else {"": args.local_rank},
+        pad_token_id=tokenizer.eos_token_id  # 명시적으로 설정
     )
     
-    # Load student model
+    # Load student model - pad_token_id 명시적 설정
     if args.from_checkpoint:
         logger.info(f"Loading student model from checkpoint {args.from_checkpoint}")
         student_model = AutoModelForCausalLM.from_pretrained(
             args.from_checkpoint,
             torch_dtype=torch.bfloat16,
+            pad_token_id=tokenizer.eos_token_id  # 명시적으로 설정
         )
     else:
         logger.info(f"Loading student model from {args.student_model_name_or_path}")
         student_model = AutoModelForCausalLM.from_pretrained(
             args.student_model_name_or_path,
             torch_dtype=torch.bfloat16,
+            pad_token_id=tokenizer.eos_token_id  # 명시적으로 설정
         )
     
     # Load datasets using the imported functions
@@ -438,6 +482,10 @@ def train(args):
     
     # Training loop
     global_step = 0
+    steps_trained_in_current_epoch = 0
+    train_steps = 0  # 실제 훈련 스텝 카운터 추가
+    
+    # 프로그레스 바 설정
     progress_bar = tqdm(
         range(max_steps),
         disable=(args.local_rank != -1 and args.local_rank != 0),
@@ -455,11 +503,16 @@ def train(args):
             train_dataloader.sampler.set_epoch(epoch)
         
         for step, batch in enumerate(train_dataloader):
+            train_steps += 1  # 각 배치마다 증가
+            
+            # 디버그 로그 추가
+            if args.local_rank in [-1, 0] and train_steps % 10 == 0:
+                logger.debug(f"Train step: {train_steps}, Global step: {global_step}, Accum step: {step % args.gradient_accumulation_steps + 1}/{args.gradient_accumulation_steps}")
+            
             # Move batch to the appropriate device
             if args.deepspeed:
                 # DeepSpeed handles device placement
                 batch = {k: v.to(torch.device("cuda")) for k, v in batch.items()}
-                # pass
             else:
                 batch = {k: v.to(torch.device("cuda")) for k, v in batch.items()}
             
@@ -472,6 +525,11 @@ def train(args):
                 # DeepSpeed handles loss scaling and backward
                 kd_model.backward(loss)
                 kd_model.step()
+                # DeepSpeed에서도 global_step 증가 및 프로그레스 바 업데이트
+                global_step += 1
+                if args.local_rank in [-1, 0]:
+                    progress_bar.update(1)
+                    progress_bar.set_description(f"Training (loss: {loss.item():.4f})")
             else:
                 # Manually handle gradient accumulation
                 loss = loss / args.gradient_accumulation_steps
@@ -483,12 +541,21 @@ def train(args):
                     lr_scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
-                    progress_bar.update(1)
+                    
+                    # 프로그레스 바 명시적 업데이트
+                    if args.local_rank in [-1, 0]:
+                        progress_bar.update(1)
+                        progress_bar.set_description(f"Training (loss: {loss.item()*args.gradient_accumulation_steps:.4f})")
             
-            # Log progress
-            if global_step % args.logging_steps == 0 and (args.local_rank == -1 or args.local_rank == 0):
+            # Log progress (step마다 변하는 값으로 교체)
+            if train_steps % args.logging_steps == 0 and (args.local_rank == -1 or args.local_rank == 0):
                 # Prepare log data
-                log_data = {"step": global_step, "loss": loss.item() * args.gradient_accumulation_steps}
+                log_data = {
+                    "train_step": train_steps,
+                    "global_step": global_step,
+                    "epoch": epoch + 1,
+                    "loss": loss.item() * (args.gradient_accumulation_steps if not args.deepspeed else 1)
+                }
                 
                 # Add KD-specific metrics
                 if args.kd_mode == "token":
@@ -509,14 +576,15 @@ def train(args):
                 log_data["learning_rate"] = lr_scheduler.get_last_lr()[0]
                 
                 # Update progress bar
-                progress_bar.set_postfix(**{k: v for k, v in log_data.items() if k != "step"})
+                if args.local_rank in [-1, 0]:
+                    progress_bar.set_postfix(**{k: v for k, v in log_data.items() if k not in ["train_step", "global_step", "epoch"]})
                 
                 # Log to wandb
                 if args.use_wandb:
                     wandb.log(log_data)
             
             # Evaluate model
-            if global_step % args.eval_steps == 0 and (args.local_rank == -1 or args.local_rank == 0):
+            if global_step % args.eval_steps == 0 and global_step > 0 and (args.local_rank == -1 or args.local_rank == 0):
                 logger.info("Evaluating model...")
                 eval_results = evaluate(kd_model, eval_dataloader, args)
                 
@@ -560,7 +628,8 @@ def evaluate(kd_model, eval_dataloader, args):
             # Move batch to the appropriate device
             if args.deepspeed:
                 # DeepSpeed handles device placement
-                pass
+                batch = {k: v.to(torch.device("cuda")) for k, v in batch.items()}
+                # pass
             else:
                 batch = {k: v.to(torch.device("cuda")) for k, v in batch.items()}
             
