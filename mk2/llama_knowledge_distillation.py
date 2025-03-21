@@ -136,8 +136,8 @@ class SentenceLevelKD(nn.Module):
             teacher_outputs = self.teacher_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_length=input_ids.shape[1],
-                do_sample=False,
+                max_new_tokens=100,
+                do_sample=True,
                 num_beams=1,
             )
         
@@ -241,8 +241,8 @@ class HybridKD(nn.Module):
             teacher_generated = self.teacher_model.generate(
                 input_ids=input_ids, 
                 attention_mask=attention_mask,
-                max_length=input_ids.shape[1],
-                do_sample=False,
+                max_new_tokens = 100,
+                do_sample=True,
                 num_beams=1,
             )
         
@@ -458,7 +458,8 @@ def train(args):
             # Move batch to the appropriate device
             if args.deepspeed:
                 # DeepSpeed handles device placement
-                pass
+                batch = {k: v.to(torch.device("cuda")) for k, v in batch.items()}
+                # pass
             else:
                 batch = {k: v.to(torch.device("cuda")) for k, v in batch.items()}
             
