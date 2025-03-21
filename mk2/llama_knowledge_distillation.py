@@ -21,23 +21,20 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
 from tqdm import tqdm
 
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    DataCollatorForLanguageModeling,
     get_scheduler,
     set_seed
 )
-from datasets import load_dataset
 import deepspeed
 import wandb
 
-# Import config
+# Import config and dataset utilities
 from config import parse_args
+from dataset import prepare_datasets, create_dataloaders
 
 # Configure logging
 logging.basicConfig(
@@ -46,133 +43,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-#################################
-# DATASET IMPLEMENTATION
-#################################
-
-class MathProblemDataset(Dataset):
-    """Dataset class for Open-platyplus math problems with Chain-of-Thought (CoT) solutions"""
-    
-    def __init__(self, 
-                 data, 
-                 tokenizer,
-                 max_seq_length: int = 1024):
-        self.data = data
-        self.tokenizer = tokenizer
-        self.max_seq_length = max_seq_length
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        
-        # Format as problem + solution (CoT format)
-        problem = item["problem"]
-        solution = item["solution"]
-        
-        # Combine as instruction format
-        text = f"Problem: {problem}\n\nSolution: {solution}"
-        
-        # Tokenize
-        encodings = self.tokenizer(
-            text,
-            max_length=self.max_seq_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        
-        # Extract inputs and create labels (for causal LM, labels are the same as inputs)
-        input_ids = encodings["input_ids"][0]
-        attention_mask = encodings["attention_mask"][0]
-        labels = input_ids.clone()
-        
-        # Mask out padding tokens in labels (-100 is ignored in loss calculation)
-        labels[attention_mask == 0] = -100
-        
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-
-def prepare_datasets(tokenizer, max_seq_length: int):
-    """Load and prepare the Open-platyplus dataset"""
-    logger.info("Loading Open-platyplus dataset...")
-    
-    # Load dataset
-    dataset = load_dataset("openplatypus/openplatyplus")
-    
-    # Filter for math problems only (optional)
-    math_keywords = ["mathematics", "math", "algebra", "calculus", "geometry", "arithmetic"]
-    
-    # Filter for math problems
-    math_data = []
-    for item in dataset["train"]:
-        for keyword in math_keywords:
-            if keyword.lower() in item["problem"].lower():
-                math_data.append(item)
-                break
-    
-    # Create 90/10 train-eval split
-    train_size = int(0.9 * len(math_data))
-    train_data = math_data[:train_size]
-    eval_data = math_data[train_size:]
-    
-    logger.info(f"Created dataset with {len(train_data)} training and {len(eval_data)} evaluation examples")
-    
-    # Create datasets
-    train_dataset = MathProblemDataset(
-        data=train_data,
-        tokenizer=tokenizer,
-        max_seq_length=max_seq_length,
-    )
-    
-    eval_dataset = MathProblemDataset(
-        data=eval_data,
-        tokenizer=tokenizer,
-        max_seq_length=max_seq_length,
-    )
-    
-    return train_dataset, eval_dataset
-
-def create_dataloaders(train_dataset, eval_dataset, args, tokenizer):
-    """Create DataLoaders for training and evaluation"""
-    # Create data collator for language modeling
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,  # We want causal language modeling, not masked
-    )
-    
-    # Create training dataloader
-    if args.local_rank == -1:
-        train_sampler = torch.utils.data.RandomSampler(train_dataset)
-    else:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    
-    train_dataloader = DataLoader(
-        train_dataset,
-        sampler=train_sampler,
-        batch_size=args.per_device_train_batch_size,
-        collate_fn=data_collator,
-        pin_memory=True,
-        num_workers=4,
-    )
-    
-    # Create evaluation dataloader
-    eval_sampler = torch.utils.data.SequentialSampler(eval_dataset)
-    eval_dataloader = DataLoader(
-        eval_dataset,
-        sampler=eval_sampler,
-        batch_size=args.per_device_eval_batch_size,
-        collate_fn=data_collator,
-        pin_memory=True,
-        num_workers=2,
-    )
-    
-    return train_dataloader, eval_dataloader
 
 #################################
 # KNOWLEDGE DISTILLATION MODELS
@@ -241,12 +111,16 @@ class SentenceLevelKD(nn.Module):
     """
     Sentence-level Knowledge Distillation
     Student model learns to generate the same output as the teacher model.
+    
+    If prefix_length > 0, only the first prefix_length tokens are used for KD,
+    reducing computational overhead and focusing on important initial reasoning steps.
     """
     
-    def __init__(self, student_model, teacher_model):
+    def __init__(self, student_model, teacher_model, prefix_length=0):
         super().__init__()
         self.student_model = student_model
         self.teacher_model = teacher_model
+        self.prefix_length = prefix_length
         
         # Freeze teacher model
         for param in self.teacher_model.parameters():
@@ -267,13 +141,41 @@ class SentenceLevelKD(nn.Module):
                 num_beams=1,
             )
         
-        # Get student outputs (using teacher outputs as labels)
-        # This implements the sentence-level distillation from the paper
-        # The student is trained with the teacher's output as the target
+        # If prefix_length is set, use only the prefix tokens for KD
+        if self.prefix_length > 0:
+            # Create labels with only the first prefix_length tokens from teacher outputs
+            # Set the rest to -100 (ignored in loss calculation)
+            prefix_labels = teacher_outputs.clone()
+            
+            # Find actual sequence length for each example (excluding padding)
+            seq_lengths = torch.sum(teacher_outputs != self.teacher_model.config.pad_token_id, dim=1)
+            
+            # For each example, keep only the first prefix_length tokens, set rest to -100
+            for i in range(prefix_labels.size(0)):
+                # Determine the actual prefix length (min of sequence length and prefix_length)
+                actual_prefix_len = min(int(seq_lengths[i].item()), self.prefix_length)
+                
+                # Set all tokens after the prefix to -100
+                if actual_prefix_len < prefix_labels.size(1):
+                    prefix_labels[i, actual_prefix_len:] = -100
+            
+            # Use prefix labels for KD
+            teacher_targets = prefix_labels
+            
+            logger.debug(f"Using prefix of length {self.prefix_length} for sentence-level KD")
+        else:
+            # Use full teacher outputs as targets
+            teacher_targets = teacher_outputs
+            
+            logger.debug("Using full teacher outputs for sentence-level KD")
+        
+        # Get student outputs using teacher outputs as labels
+        # This implements the sentence-level distillation - the student is trained 
+        # with the teacher's output (or prefix thereof) as the target
         student_outputs = self.student_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            labels=teacher_outputs,
+            labels=teacher_targets,
             return_dict=True,
         )
         
@@ -290,13 +192,16 @@ class HybridKD(nn.Module):
     Hybrid Knowledge Distillation
     Combines token-level and sentence-level KD with a learnable gating mechanism.
     This implements the hybrid method described in the paper.
+    
+    Also supports prefix-based sentence-level KD when prefix_length > 0.
     """
     
-    def __init__(self, student_model, teacher_model, temperature=1.0, initial_gate_value=0.5):
+    def __init__(self, student_model, teacher_model, temperature=1.0, initial_gate_value=0.5, prefix_length=0):
         super().__init__()
         self.student_model = student_model
         self.teacher_model = teacher_model
         self.temperature = temperature
+        self.prefix_length = prefix_length
         
         # Initialize the gate parameter as described in the paper
         # This will be learned during training to balance token-level and sentence-level KD
@@ -349,11 +254,29 @@ class HybridKD(nn.Module):
             log_target=False,
         ) * (self.temperature ** 2)
         
+        # Prepare teacher outputs for sentence-level KD
+        if self.prefix_length > 0:
+            # Create a copy for modification
+            prefix_generated = teacher_generated.clone()
+            
+            # Find actual sequence length for each example
+            seq_lengths = torch.sum(prefix_generated != self.teacher_model.config.pad_token_id, dim=1)
+            
+            # For each example, keep only the first prefix_length tokens for loss calculation
+            for i in range(prefix_generated.size(0)):
+                actual_prefix_len = min(int(seq_lengths[i].item()), self.prefix_length)
+                if actual_prefix_len < prefix_generated.size(1):
+                    prefix_generated[i, actual_prefix_len:] = -100  # Ignore these tokens in loss
+            
+            sentence_targets = prefix_generated
+        else:
+            sentence_targets = teacher_generated
+        
         # Calculate sentence-level KD loss (matching teacher's generated outputs)
         # Calculate cross-entropy loss between student predictions and teacher's generated tokens
         sentence_kd_loss = F.cross_entropy(
             student_logits.view(-1, student_logits.size(-1)),
-            teacher_generated.view(-1),
+            sentence_targets.view(-1),
             ignore_index=-100,
         )
         
@@ -378,14 +301,14 @@ class HybridKD(nn.Module):
             "logits": student_logits,
         }
 
-def create_kd_model(kd_mode, student_model, teacher_model, temperature=1.0, initial_gate_value=0.5):
+def create_kd_model(kd_mode, student_model, teacher_model, temperature=1.0, initial_gate_value=0.5, prefix_length=0):
     """Create the appropriate KD model based on the mode"""
     if kd_mode == "token":
         return TokenLevelKD(student_model, teacher_model, temperature)
     elif kd_mode == "sentence":
-        return SentenceLevelKD(student_model, teacher_model)
+        return SentenceLevelKD(student_model, teacher_model, prefix_length)
     elif kd_mode == "hybrid":
-        return HybridKD(student_model, teacher_model, temperature, initial_gate_value)
+        return HybridKD(student_model, teacher_model, temperature, initial_gate_value, prefix_length)
     else:
         raise ValueError(f"Unknown KD mode: {kd_mode}")
 
@@ -446,18 +369,22 @@ def train(args):
             torch_dtype=torch.bfloat16,
         )
     
-    # Load datasets
+    # Load datasets using the imported functions
     train_dataset, eval_dataset = prepare_datasets(tokenizer, args.max_seq_length)
     train_dataloader, eval_dataloader = create_dataloaders(train_dataset, eval_dataset, args, tokenizer)
     
-    # Initialize KD model
+    # Initialize KD model with prefix length if applicable
     logger.info(f"Initializing {args.kd_mode} knowledge distillation")
+    if args.prefix_length > 0:
+        logger.info(f"Using prefix-based distillation with prefix length {args.prefix_length}")
+    
     kd_model = create_kd_model(
         kd_mode=args.kd_mode,
         student_model=student_model,
         teacher_model=teacher_model,
         temperature=args.temperature,
         initial_gate_value=args.initial_gate_value,
+        prefix_length=args.prefix_length
     )
     
     # Calculate total training steps
@@ -504,6 +431,7 @@ def train(args):
     logger.info(f"  KD mode = {args.kd_mode}")
     logger.info(f"  Teacher model = {args.teacher_model_name_or_path}")
     logger.info(f"  Student model = {args.student_model_name_or_path}")
+    logger.info(f"  Prefix length = {args.prefix_length if args.prefix_length > 0 else 'Full sequence'}")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num epochs = {args.num_train_epochs}")
     logger.info(f"  Total optimization steps = {max_steps}")

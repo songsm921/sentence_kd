@@ -40,6 +40,12 @@ def parse_args():
         default=0.5,
         help="Initial gate value (0-1) for hybrid KD mode",
     )
+    parser.add_argument(
+        "--prefix_length",
+        type=int,
+        default=0,
+        help="Number of prefix tokens to use for sentence-level KD (0 means use all tokens)",
+    )
     
     # Model settings
     parser.add_argument(

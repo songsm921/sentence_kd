@@ -1,10 +1,11 @@
 #!/bin/bash
 
 # Define variables
-TEACHER_MODEL="meta-llama/Llama-3.1-8B"
-STUDENT_MODEL="meta-llama/Llama-3.2-3B"
+TEACHER_MODEL="/mnt/cephfs/sumin/model/Llama-3.2-3B-Instruct"
+STUDENT_MODEL="/mnt/cephfs/sumin/model/Llama-3.2-1B-Instruct"
 OUTPUT_DIR="./output"
 KD_MODE="hybrid"  # Options: token, sentence, hybrid
+PREFIX_LENGTH=10  # Number of prefix tokens to use for KD (0 = use all tokens)
 
 # Create output directory
 mkdir -p $OUTPUT_DIR
@@ -13,13 +14,14 @@ mkdir -p $OUTPUT_DIR
 deepspeed --num_gpus=8 llama_knowledge_distillation.py \
   --teacher_model_name_or_path $TEACHER_MODEL \
   --student_model_name_or_path $STUDENT_MODEL \
-  --output_dir $OUTPUT_DIR/$KD_MODE \
+  --output_dir $OUTPUT_DIR/${KD_MODE}_prefix${PREFIX_LENGTH} \
   --kd_mode $KD_MODE \
   --initial_gate_value 0.5 \
   --temperature 1.0 \
-  --max_seq_length 1024 \
-  --per_device_train_batch_size 4 \
-  --per_device_eval_batch_size 4 \
+  --prefix_length $PREFIX_LENGTH \
+  --max_seq_length 2048 \
+  --per_device_train_batch_size 1 \
+  --per_device_eval_batch_size 1 \
   --gradient_accumulation_steps 8 \
   --learning_rate 5e-5 \
   --num_train_epochs 3 \
@@ -28,6 +30,3 @@ deepspeed --num_gpus=8 llama_knowledge_distillation.py \
   --save_steps 1000 \
   --eval_steps 500 \
   --deepspeed ds_config.json \
-  --use_wandb \
-  --wandb_project "llama-kd" \
-  --wandb_name "${KD_MODE}-distillation"
