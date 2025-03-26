@@ -584,23 +584,23 @@ def train(args):
                     wandb.log(log_data)
             
             # Evaluate model
-            if global_step % args.eval_steps == 0 and global_step > 0 and (args.local_rank == -1 or args.local_rank == 0):
-                logger.info("Evaluating model...")
-                eval_results = evaluate(kd_model, eval_dataloader, args)
+            # if global_step % args.eval_steps == 0 and global_step > 0 and (args.local_rank == -1 or args.local_rank == 0):
+            #     logger.info("Evaluating model...")
+            #     eval_results = evaluate(kd_model, eval_dataloader, args)
                 
-                # Log evaluation results
-                if args.use_wandb:
-                    wandb.log({"eval_" + k: v for k, v in eval_results.items()})
+            #     # Log evaluation results
+            #     if args.use_wandb:
+            #         wandb.log({"eval_" + k: v for k, v in eval_results.items()})
                 
-                # Print evaluation results
-                logger.info(f"Evaluation results: {eval_results}")
+            #     # Print evaluation results
+            #     logger.info(f"Evaluation results: {eval_results}")
                 
-                # Set back to training mode
-                kd_model.train()
+            #     # Set back to training mode
+            #     kd_model.train()
             
-            # Save checkpoint
-            if global_step % args.save_steps == 0 and global_step > 0 and (args.local_rank == -1 or args.local_rank == 0):
-                save_checkpoint(kd_model, tokenizer, args, global_step)
+            # # Save checkpoint
+            # if global_step % args.save_steps == 0 and global_step > 0 and (args.local_rank == -1 or args.local_rank == 0):
+            #     save_checkpoint(kd_model, tokenizer, args, global_step)
             
             # Check if we've reached max steps
             if global_step >= max_steps:
@@ -609,6 +609,7 @@ def train(args):
     # Save final model
     if args.local_rank == -1 or args.local_rank == 0:
         logger.info("Training complete, saving final model")
+        kd_model.student_model.save_pretrained('/mnt/cephfs/sumin/sentence_kd/mk2/output/temp_model', safe_serialization=True)
         save_checkpoint(kd_model, tokenizer, args, global_step, final=True)
     
     return global_step
@@ -677,10 +678,10 @@ def save_checkpoint(kd_model, tokenizer, args, global_step, final=False):
     if args.deepspeed:
         # Using the DeepSpeed checkpoint saving utility
         kd_model.save_checkpoint(output_dir)
-        
+        kd_model.student_model.save_pretrained(output_dir, safe_serialization=True)
         # Also save the model in HuggingFace format
-        if hasattr(kd_model, "student_model"):
-            kd_model.student_model.save_pretrained(output_dir)
+        # if hasattr(kd_model, "student_model"):
+        #     kd_model.student_model.save_pretrained(output_dir)
     else:
         # Regular saving
         if hasattr(kd_model, "student_model"):

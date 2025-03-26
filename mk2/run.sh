@@ -1,5 +1,5 @@
 #!/bin/bash
-
+export NCCL_P2P_DISABLE=1
 # Define variables
 TEACHER_MODEL="/mnt/cephfs/sumin/model/Llama-3.2-3B-Instruct"
 STUDENT_MODEL="/mnt/cephfs/sumin/model/Llama-3.2-1B-Instruct"
