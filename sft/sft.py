@@ -5,7 +5,7 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-from datasets import load_dataset, concatenate_datasets, DatasetDict, Dataset
+from datasets import load_dataset, concatenate_datasets, DatasetDict, Dataset, load_from_disk
 import transformers
 import trl
 import random
@@ -18,6 +18,7 @@ class TrainingConfig:
     wandb_entity: Optional[str] = field(default="hashimoto-group")
     train_file_path: Optional[str] = field(default='simplescaling/s1K_tokenized')
     dagger: bool = field(default=False)
+    local_train_file: bool = field(default=False)
     # 난이도 관련 설정 추가
     add_difficulty_instruction: bool = field(default=True)
     example_count: int = field(default=100)  # 예시 난이도를 추가할 데이터 수
@@ -184,13 +185,17 @@ def train():
         model = transformers.AutoModelForCausalLM.from_pretrained(config.model_name)
     
     # 데이터셋 로드
-    dataset = load_dataset(config.train_file_path)
+    if config.local_train_file:
+        logging.info('Loading local train file...')
+        dataset = load_from_disk("/mnt/cephfs/sumin/sentence_kd/dataset/stable/mk4_before_think")
+    else:
+        dataset = load_dataset(config.train_file_path)
     
     # 데이터셋 전처리 (난이도 평가 지시 및 예시 추가)
-    processed_dataset = preprocess_dataset(dataset, config)
+    # processed_dataset = preprocess_dataset(dataset, config)
     
     # 데이터셋 샘플 로깅 (디버깅용)
-    logging.info(f"Processed dataset sample: {processed_dataset['train'][0]}")
+    # logging.info(f"Processed dataset sample: {processed_dataset['train'][0]}")
     
     # setting up trainer
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
@@ -217,8 +222,8 @@ def train():
     args.max_seq_length = config.block_size
     trainer = trl.SFTTrainer(
         model,
-        train_dataset=processed_dataset['train'],
-        eval_dataset=processed_dataset['test'] if 'test' in processed_dataset else processed_dataset['train'],
+        train_dataset=dataset['train'],
+        eval_dataset=dataset['test'] if 'test' in dataset else dataset['train'],
         args=args,
         data_collator=collator
     )

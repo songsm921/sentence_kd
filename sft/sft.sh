@@ -5,7 +5,7 @@ min_lr=0
 epochs=5
 weight_decay=1e-4 # -> the same training pipe as slurm_training
 micro_batch_size=1 # -> batch_size will be 16 if 16 gpus
-gradient_accumulation_steps=1 # requires more GPU memory
+gradient_accumulation_steps=2 # requires more GPU memory
 max_steps=-1
 gpu_count=$(nvidia-smi -L | wc -l)
 push_to_hub=false
@@ -21,6 +21,7 @@ torchrun --nproc-per-node ${gpu_count} --master_port 12345 \
     --per_device_eval_batch_size=${micro_batch_size} \
     --gradient_accumulation_steps=${gradient_accumulation_steps} \
     --num_train_epochs=${epochs} \
+    --local_train_file=True \
     --train_file_path="simplescaling/s1K_tokenized" \
     --model_name=${base_model} \
     --warmup_ratio=0.05 \
@@ -39,6 +40,6 @@ torchrun --nproc-per-node ${gpu_count} --master_port 12345 \
     --push_to_hub=${push_to_hub} \
     --save_only_model=True \
     --add_difficulty_instruction=${add_difficulty_instruction} \
-    --example_count=${example_count}
-    # --gradient_checkpointing=True \ Enable gradient checkpointing for efficient memory usage with 8 H100 GPUs.
-    # --accelerator_config='{"gradient_accumulation_kwargs": {"sync_each_batch": true}}'
+    --example_count=${example_count} \
+    --gradient_checkpointing=True \
+    --accelerator_config='{"gradient_accumulation_kwargs": {"sync_each_batch": true}}'
